@@ -647,6 +647,7 @@ pub struct DebugInfo {
     pub num_lights: u32,
     pub num_visible_chunks: u32,
     pub num_shadow_chunks: u32,
+    pub terrain_stream: crate::scene::terrain::TerrainStreamMetrics,
     pub num_figures: u32,
     pub num_figures_visible: u32,
     pub num_particles: u32,
@@ -2958,9 +2959,18 @@ impl Hud {
             debug_msg_line_count += 1;
 
             // Number of chunks
+            let terrain_stream = debug_info.terrain_stream;
             let debug_msg_num_chunks = format!(
-                "Chunks: {} ({} visible) & {} (shadow)",
-                debug_info.num_chunks, debug_info.num_visible_chunks, debug_info.num_shadow_chunks,
+                "Chunks: {} ({} visible) & {} (shadow), upload {:?}/{:?} ({} over), mesh mem \
+                 {:.1}/{:.1} MiB",
+                debug_info.num_chunks,
+                debug_info.num_visible_chunks,
+                debug_info.num_shadow_chunks,
+                terrain_stream.peak_upload_time,
+                terrain_stream.upload_budget,
+                terrain_stream.upload_budget_overruns,
+                terrain_stream.peak_estimated_memory_bytes as f32 / (1024.0 * 1024.0),
+                terrain_stream.memory_budget_bytes as f32 / (1024.0 * 1024.0),
             );
             Text::new(&debug_msg_num_chunks)
                 .color(TEXT_COLOR)

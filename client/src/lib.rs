@@ -50,7 +50,7 @@ use common::{
     spiral::Spiral2d,
     terrain::{
         BiomeKind, CoordinateConversions, SiteKindMeta, SpriteKind, TerrainChunk, TerrainChunkSize,
-        TerrainGrid, block::Block, map::MapConfig, neighbors,
+        TerrainGrid, block::Block, map::MapConfig, neighbors, stream,
     },
     trade::{PendingTrade, SitePrices, TradeAction, TradeId, TradeResult},
     uid::{IdMaps, Uid},
@@ -2458,7 +2458,14 @@ impl Client {
                 self.state.remove_chunk(key);
             }
 
-            let mut current_tick_send_chunk_requests = 0;
+            let velocity = self
+                .state
+                .read_storage::<comp::Vel>()
+                .get(self.entity())
+                .map_or(Vec2::zero(), |vel| vel.0.xy());
+            let stream_config = stream::TerrainStreamConfig::default();
+            let mut request_candidates = HashMap::<Vec2<i32>, f32>::new();
+
             // Request chunks from the server.
             self.loaded_distance = ((view_distance * TerrainChunkSize::RECT_SIZE.x) as f32).powi(2);
             // +1 so we can find a chunk that's outside the vd for better fog
@@ -2480,7 +2487,6 @@ impl Client {
                     dist
                 };
 
-                let mut skip_mode = false;
                 for i in -top..top + 1 {
                     let keys = [
                         chunk_pos + Vec2::new(dist, i),
@@ -2490,34 +2496,32 @@ impl Client {
                     ];
 
                     for key in keys.iter() {
-                        let dist_to_player = (TerrainGrid::key_chunk(*key).map(|x| x as f32)
+                        let key = *key;
+                        let dist_to_player = (TerrainGrid::key_chunk(key).map(|x| x as f32)
                             + TerrainChunkSize::RECT_SIZE.map(|x| x as f32) / 2.0)
                             .distance_squared(pos.0.into());
 
                         let terrain = self.state.terrain();
-                        if let Some(chunk) = terrain.get_key_arc(*key) {
-                            if !skip_mode && !terrain.contains_key_real(*key) {
+                        if let Some(chunk) = terrain.get_key_arc(key) {
+                            if !terrain.contains_key_real(key) {
                                 let chunk = Arc::clone(chunk);
                                 drop(terrain);
-                                self.state.insert_chunk(*key, chunk);
+                                self.state.insert_chunk(key, chunk);
                             }
                         } else {
                             drop(terrain);
-                            if !skip_mode && !self.pending_chunks.contains_key(key) {
-                                const TOTAL_PENDING_CHUNKS_LIMIT: usize = 12;
-                                const CURRENT_TICK_PENDING_CHUNKS_LIMIT: usize = 2;
-                                if self.pending_chunks.len() < TOTAL_PENDING_CHUNKS_LIMIT
-                                    && current_tick_send_chunk_requests
-                                        < CURRENT_TICK_PENDING_CHUNKS_LIMIT
-                                {
-                                    self.send_msg_err(ClientGeneral::TerrainChunkRequest {
-                                        key: *key,
-                                    })?;
-                                    current_tick_send_chunk_requests += 1;
-                                    self.pending_chunks.insert(*key, Instant::now());
-                                } else {
-                                    skip_mode = true;
-                                }
+                            if !self.pending_chunks.contains_key(&key) {
+                                let priority = stream::prefetch_priority(
+                                    key,
+                                    pos.0.xy(),
+                                    velocity,
+                                    view_distance as f32,
+                                    stream_config.prefetch_lookahead,
+                                );
+                                request_candidates
+                                    .entry(key)
+                                    .and_modify(|old| *old = old.min(priority))
+                                    .or_insert(priority);
                             }
 
                             if dist_to_player < self.loaded_distance {
@@ -2527,6 +2531,21 @@ impl Client {
                     }
                 }
             }
+
+            // Requests are sent in predicted-arrival order rather than ring order.
+            // The total and per-tick limits keep prefetching from becoming a
+            // bandwidth/memory burst when flying across chunk boundaries.
+            let mut candidates = request_candidates.into_iter().collect::<Vec<_>>();
+            candidates.sort_by(|(_, a), (_, b)| a.total_cmp(b));
+            let request_budget = stream_config
+                .max_pending_requests
+                .saturating_sub(self.pending_chunks.len())
+                .min(stream_config.request_budget_per_tick);
+            for (key, _) in candidates.into_iter().take(request_budget) {
+                self.send_msg_err(ClientGeneral::TerrainChunkRequest { key })?;
+                self.pending_chunks.insert(key, Instant::now());
+            }
+
             self.loaded_distance = self.loaded_distance.sqrt()
                 - ((TerrainChunkSize::RECT_SIZE.x as f32 / 2.0).powi(2)
                     + (TerrainChunkSize::RECT_SIZE.y as f32 / 2.0).powi(2))

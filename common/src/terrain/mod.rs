@@ -4,6 +4,7 @@ pub mod chonk;
 pub mod map;
 pub mod site;
 pub mod sprite;
+pub mod stream;
 pub mod structure;
 
 use std::ops::{Add, Mul};

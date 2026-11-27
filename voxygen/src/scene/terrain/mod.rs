@@ -29,7 +29,7 @@ use common::{
     assets::{AssetExt, DotVox},
     figure::Segment,
     spiral::Spiral2d,
-    terrain::{Block, SpriteKind, TerrainChunk},
+    terrain::{Block, SpriteKind, TerrainChunk, stream},
     vol::{BaseVol, ReadVol, RectRasterableVol, SampleVol},
     volumes::vol_grid_2d::{VolGrid2d, VolGrid2dError},
 };
@@ -38,9 +38,13 @@ use core::{f32, fmt::Debug, marker::PhantomData, time::Duration};
 use crossbeam_channel as channel;
 use guillotiere::AtlasAllocator;
 use hashbrown::HashMap;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use specs::WorldExt;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
 };
 use tracing::warn;
 use treeculler::{AABB, BVol, Frustum};
@@ -104,6 +108,8 @@ pub struct TerrainChunkData {
     frustum_last_plane_index: u8,
 
     alt_indices: AltIndices,
+    /// Conservative estimate of the CPU/GPU storage owned by this chunk.
+    estimated_bytes: usize,
 }
 
 /// The depth at which the intermediate zone between underground and surface
@@ -429,7 +435,11 @@ pub struct Terrain<V: RectRasterableVol = TerrainChunk> {
     mesh_recv: channel::Receiver<MeshWorkerResponse>,
     mesh_todo: HashMap<Vec2<i32>, ChunkMeshState>,
     mesh_todos_active: Arc<AtomicU64>,
-    mesh_recv_overflow: f32,
+    stream_config: stream::TerrainStreamConfig,
+    memory_budget: stream::MemoryBudget,
+    peak_upload_spent: Duration,
+    upload_budget_overruns: u64,
+    memory_budget_warned: bool,
 
     // GPU data
     // Maps sprite kind + variant to data detailing how to render it
@@ -442,6 +452,27 @@ pub struct Terrain<V: RectRasterableVol = TerrainChunk> {
     atlas_textures: Arc<AtlasTextures<pipelines::terrain::Locals, TerrainAtlasData>>,
 
     phantom: PhantomData<V>,
+}
+
+fn estimate_chunk_bytes(mesh: &MeshWorkerResponseMesh, sprite_instance_count: usize) -> usize {
+    let vertex_bytes = mesh.opaque_mesh.len() * size_of::<TerrainVertex>()
+        + mesh.fluid_mesh.len() * size_of::<FluidVertex>();
+    let atlas_bytes = mesh.atlas_size.as_::<usize>().product() * 5;
+    let sprite_bytes = sprite_instance_count * size_of::<SpriteInstance>();
+    vertex_bytes
+        .saturating_add(atlas_bytes)
+        .saturating_add(sprite_bytes)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TerrainStreamMetrics {
+    pub peak_upload_time: Duration,
+    pub upload_budget: Duration,
+    pub upload_budget_overruns: u64,
+    pub estimated_memory_bytes: usize,
+    pub peak_estimated_memory_bytes: usize,
+    pub memory_budget_bytes: usize,
+    pub shadow_chunks: usize,
 }
 
 impl TerrainChunkData {
@@ -664,7 +695,13 @@ impl<V: RectRasterableVol> Terrain<V> {
             mesh_recv: recv,
             mesh_todo: HashMap::default(),
             mesh_todos_active: Arc::new(AtomicU64::new(0)),
-            mesh_recv_overflow: 0.0,
+            stream_config: stream::TerrainStreamConfig::default(),
+            memory_budget: stream::MemoryBudget::new(
+                stream::TerrainStreamConfig::default().memory_budget_bytes,
+            ),
+            peak_upload_spent: Duration::ZERO,
+            upload_budget_overruns: 0,
+            memory_budget_warned: false,
             sprite_render_state: sprite_render_context.state,
             sprite_globals: renderer.bind_sprite_globals(
                 global_model,
@@ -750,9 +787,21 @@ impl<V: RectRasterableVol> Terrain<V> {
     }
 
     fn insert_chunk(&mut self, pos: Vec2<i32>, chunk: TerrainChunkData) {
-        if let Some(old) = self.chunks.insert(pos, chunk) {
+        // A returned chunk supersedes the dead copy retained for shadow stability.
+        if let Some(shadow_idx) = self
+            .shadow_chunks
+            .iter()
+            .position(|(shadow_pos, _)| *shadow_pos == pos)
+        {
+            let (_, shadow_chunk) = self.shadow_chunks.swap_remove(shadow_idx);
+            self.memory_budget.release(shadow_chunk.estimated_bytes);
+        }
+        if let Some(old) = self.chunks.remove(&pos) {
+            self.memory_budget.release(old.estimated_bytes);
             self.remove_chunk_meta(pos, &old);
         }
+        self.memory_budget.force_charge(chunk.estimated_bytes);
+        self.chunks.insert(pos, chunk);
         /* let (zmin, zmax) = chunk.z_bounds;
         self.z_index_up.insert(Vec3::from(zmin, pos.x, pos.y));
         self.z_index_down.insert(Vec3::from(zmax, pos.x, pos.y)); */
@@ -761,12 +810,29 @@ impl<V: RectRasterableVol> Terrain<V> {
     fn remove_chunk(&mut self, pos: Vec2<i32>) {
         if let Some(chunk) = self.chunks.remove(&pos) {
             self.remove_chunk_meta(pos, &chunk);
-            // Temporarily remember dead chunks for shadowing purposes.
-            self.shadow_chunks.push((pos, chunk));
+            // Temporarily remember dead chunks for shadowing purposes, but never
+            // let this optional cache grow without bound while flying.
+            if self.shadow_chunks.len() < self.stream_config.max_shadow_chunks
+                && !self.memory_budget.over_budget()
+            {
+                self.shadow_chunks.push((pos, chunk));
+            } else {
+                self.memory_budget.release(chunk.estimated_bytes);
+            }
         }
 
         if let Some(_todo) = self.mesh_todo.remove(&pos) {
             //Do nothing on todo mesh removal.
+        }
+    }
+
+    fn trim_shadow_chunks(&mut self) {
+        let excess = self
+            .shadow_chunks
+            .len()
+            .saturating_sub(self.stream_config.max_shadow_chunks);
+        for (_, chunk) in self.shadow_chunks.drain(..excess) {
+            self.memory_budget.release(chunk.estimated_bytes);
         }
     }
 
@@ -864,6 +930,7 @@ impl<V: RectRasterableVol> Terrain<V> {
                 }
             }
         }
+        self.trim_shadow_chunks();
 
         span!(_guard, "maintain", "Terrain::maintain");
         let current_tick = scene_data.tick;
@@ -1032,7 +1099,21 @@ impl<V: RectRasterableVol> Terrain<V> {
         };
 
         span!(guard, "Queue meshing from todo list");
-        let mesh_focus_pos = focus_pos.map(|e| e.trunc()).xy().as_::<i64>();
+        let focus_velocity = scene_data
+            .state
+            .ecs()
+            .read_storage::<common::comp::Vel>()
+            .get(scene_data.viewpoint_entity)
+            .map_or(Vec2::zero(), |vel| vel.0.xy());
+        let view_distance = (loaded_distance / V::RECT_SIZE.x as f32).max(1.0);
+        let mesh_focus_pos = stream::prefetch_focus(
+            focus_pos.xy(),
+            focus_velocity,
+            view_distance,
+            self.stream_config.prefetch_lookahead,
+        )
+        .map(|e| e.trunc())
+        .as_::<i64>();
         //TODO: this is actually no loop, it just runs for a single entry because of
         // the `min_by_key`. Evaluate actually looping here
         while let Some((todo, chunk)) = self
@@ -1133,31 +1214,38 @@ impl<V: RectRasterableVol> Terrain<V> {
         }
         drop(guard);
 
-        // Receive a chunk mesh from a worker thread and upload it to the GPU, then
-        // store it. Vary the rate at which we pull items out to correlate with the
-        // framerate, preventing tail latency.
+        // Receive chunk meshes and upload them to the GPU. A time budget plus a hard
+        // per-frame task cap prevents a burst of completed chunks from causing a
+        // frame-time spike while flying across chunk boundaries.
         span!(guard, "Get/upload meshed chunk");
-        const CHUNKS_PER_SECOND: f32 = 240.0;
-        let recv_count =
-            scene_data.state.get_delta_time() * CHUNKS_PER_SECOND + self.mesh_recv_overflow;
-        self.mesh_recv_overflow = recv_count.fract();
-        let incoming_chunks =
-            std::iter::from_fn(|| self.mesh_recv.recv_timeout(Duration::new(0, 0)).ok())
-                .take(recv_count.floor() as usize)
-                .collect::<Vec<_>>(); // Avoid ownership issue
-        for response in incoming_chunks {
+        let mut upload_budget = stream::FrameBudget::new(
+            self.stream_config.mesh_upload_budget,
+            self.stream_config.max_mesh_uploads_per_frame,
+        );
+        while upload_budget.can_start_task() {
+            let response = match self.mesh_recv.try_recv() {
+                Ok(response) => response,
+                Err(_) => break,
+            };
+            let upload_started = Instant::now();
             match self.mesh_todo.get(&response.pos) {
                 // It's the mesh we want, insert the newly finished model into the terrain model
                 // data structure (convert the mesh to a model first of course).
                 Some(todo) if response.started_tick <= todo.started_tick => {
                     let started_tick = todo.started_tick;
 
+                    let sprite_instance_count = response
+                        .sprite_instances
+                        .iter()
+                        .map(|(instances, _)| instances.len())
+                        .sum();
                     let sprite_instances =
                         response.sprite_instances.map(|(instances, alt_indices)| {
                             (renderer.create_instances(&instances), alt_indices)
                         });
 
                     if let Some(mesh) = response.mesh {
+                        let estimated_bytes = estimate_chunk_bytes(&mesh, sprite_instance_count);
                         // Full update, insert the whole chunk.
 
                         let load_time = self
@@ -1248,6 +1336,7 @@ impl<V: RectRasterableVol> Terrain<V> {
                             sun_occluder_z_bounds: mesh.sun_occluder_z_bounds,
                             frustum_last_plane_index: 0,
                             alt_indices: mesh.alt_indices,
+                            estimated_bytes,
                         });
                     } else if let Some(chunk) = self.chunks.get_mut(&response.pos) {
                         // There was an update that didn't require a remesh (probably related to
@@ -1265,6 +1354,23 @@ impl<V: RectRasterableVol> Terrain<V> {
                 Some(_todo) => {},
                 None => {},
             }
+            upload_budget.charge(upload_started.elapsed());
+        }
+        self.peak_upload_spent = self.peak_upload_spent.max(upload_budget.spent());
+        if upload_budget.exceeded() {
+            self.upload_budget_overruns += 1;
+        }
+        if self.memory_budget.over_budget() {
+            if !self.memory_budget_warned {
+                warn!(
+                    used = self.memory_budget.used_bytes(),
+                    limit = self.memory_budget.limit_bytes(),
+                    "Terrain streaming exceeded its memory budget"
+                );
+                self.memory_budget_warned = true;
+            }
+        } else {
+            self.memory_budget_warned = false;
         }
         drop(guard);
 
@@ -1347,59 +1453,58 @@ impl<V: RectRasterableVol> Terrain<V> {
             return min.partial_cmple(&max).reduce_and();
         };
 
-        let (visible_light_volume, visible_psr_bounds) = if ray_direction.z < 0.0
-            && renderer.pipeline_modes().shadow.is_map()
-        {
-            let visible_bounding_box = math::Aabb::<f32> {
-                min: (visible_bounding_box.min - focus_off),
-                max: (visible_bounding_box.max - focus_off),
-            };
-            let visible_bounds_fine = visible_bounding_box.as_::<f64>();
-            // NOTE: We use proj_mat_treeculler here because
-            // calc_focused_light_volume_points makes the assumption that the
-            // near plane lies before the far plane.
-            let visible_light_volume = math::calc_focused_light_volume_points(
-                inv_proj_view,
-                ray_direction.as_::<f64>(),
-                visible_bounds_fine,
-                1e-6,
-            )
-            .map(|v| v.as_::<f32>())
-            .collect::<Vec<_>>();
+        let (visible_light_volume, visible_psr_bounds) =
+            if ray_direction.z < 0.0 && renderer.pipeline_modes().shadow.is_map() {
+                let visible_bounding_box = math::Aabb::<f32> {
+                    min: (visible_bounding_box.min - focus_off),
+                    max: (visible_bounding_box.max - focus_off),
+                };
+                let visible_bounds_fine = visible_bounding_box.as_::<f64>();
+                // NOTE: We use proj_mat_treeculler here because
+                // calc_focused_light_volume_points makes the assumption that the
+                // near plane lies before the far plane.
+                let visible_light_volume = math::calc_focused_light_volume_points(
+                    inv_proj_view,
+                    ray_direction.as_::<f64>(),
+                    visible_bounds_fine,
+                    1e-6,
+                )
+                .map(|v| v.as_::<f32>())
+                .collect::<Vec<_>>();
 
-            let up: math::Vec3<f32> = { math::Vec3::unit_y() };
-            let ray_mat = math::Mat4::look_at_rh(cam_pos, cam_pos + ray_direction, up);
-            let visible_bounds = math::Aabr::from(math::fit_psr(
-                ray_mat,
-                visible_light_volume.iter().copied(),
-                |p| p,
-            ));
-            let ray_mat = ray_mat * math::Mat4::translation_3d(-focus_off);
+                let up: math::Vec3<f32> = { math::Vec3::unit_y() };
+                let ray_mat = math::Mat4::look_at_rh(cam_pos, cam_pos + ray_direction, up);
+                let visible_bounds = math::Aabr::from(math::fit_psr(
+                    ray_mat,
+                    visible_light_volume.iter().copied(),
+                    |p| p,
+                ));
+                let ray_mat = ray_mat * math::Mat4::translation_3d(-focus_off);
 
-            let can_shadow_sun = |pos: Vec2<i32>, chunk: &TerrainChunkData| {
-                let chunk_pos = pos.as_::<f32>() * chunk_sz;
+                let can_shadow_sun = |pos: Vec2<i32>, chunk: &TerrainChunkData| {
+                    let chunk_pos = pos.as_::<f32>() * chunk_sz;
 
-                // Ensure the chunk is within the PSR set.
-                let chunk_box = math::Aabb {
-                    min: math::Vec3::new(chunk_pos.x, chunk_pos.y, chunk.z_bounds.0),
-                    max: math::Vec3::new(
-                        chunk_pos.x + chunk_sz,
-                        chunk_pos.y + chunk_sz,
-                        chunk.z_bounds.1,
-                    ),
+                    // Ensure the chunk is within the PSR set.
+                    let chunk_box = math::Aabb {
+                        min: math::Vec3::new(chunk_pos.x, chunk_pos.y, chunk.z_bounds.0),
+                        max: math::Vec3::new(
+                            chunk_pos.x + chunk_sz,
+                            chunk_pos.y + chunk_sz,
+                            chunk.z_bounds.1,
+                        ),
+                    };
+
+                    let chunk_from_light = math::fit_psr(
+                        ray_mat,
+                        math::aabb_to_points(chunk_box).iter().copied(),
+                        |p| p,
+                    );
+                    collides_with_aabr(chunk_from_light, visible_bounds)
                 };
 
-                let chunk_from_light = math::fit_psr(
-                    ray_mat,
-                    math::aabb_to_points(chunk_box).iter().copied(),
-                    |p| p,
-                );
-                collides_with_aabr(chunk_from_light, visible_bounds)
-            };
-
-            // Handle potential shadow casters (chunks that aren't visible, but are still in
-            // range) to see if they could cast shadows.
-            self.chunks.iter_mut()
+                // Handle potential shadow casters (chunks that aren't visible, but are still in
+                // range) to see if they could cast shadows.
+                self.chunks.iter_mut()
                 // NOTE: We deliberately avoid doing this computation for chunks we already know
                 // are visible, since by definition they'll always intersect the visible view
                 // frustum.
@@ -1408,31 +1513,40 @@ impl<V: RectRasterableVol> Terrain<V> {
                     chunk.can_shadow_sun = can_shadow_sun(pos, chunk);
                 });
 
-            // Handle dead chunks that we kept around only to make sure shadows don't blink
-            // out when a chunk disappears.
-            //
-            // If the sun can currently cast shadows, we retain only those shadow chunks
-            // that both: 1. have not been replaced by a real chunk instance,
-            // and 2. are currently potential shadow casters (as witnessed by
-            // `can_shadow_sun` returning true).
-            //
-            // NOTE: Please make sure this runs *after* any code that could insert a chunk!
-            // Otherwise we may end up with multiple instances of the chunk trying to cast
-            // shadows at the same time.
-            let chunks = &self.chunks;
-            self.shadow_chunks
-                .retain(|(pos, chunk)| !chunks.contains_key(pos) && can_shadow_sun(*pos, chunk));
+                // Handle dead chunks that we kept around only to make sure shadows don't blink
+                // out when a chunk disappears.
+                //
+                // If the sun can currently cast shadows, we retain only those shadow chunks
+                // that both: 1. have not been replaced by a real chunk instance,
+                // and 2. are currently potential shadow casters (as witnessed by
+                // `can_shadow_sun` returning true).
+                //
+                // NOTE: Please make sure this runs *after* any code that could insert a chunk!
+                // Otherwise we may end up with multiple instances of the chunk trying to cast
+                // shadows at the same time.
+                let chunks = &self.chunks;
+                let mut retained_shadow_chunks = Vec::new();
+                for (pos, chunk) in self.shadow_chunks.drain(..) {
+                    if !chunks.contains_key(&pos) && can_shadow_sun(pos, &chunk) {
+                        retained_shadow_chunks.push((pos, chunk));
+                    } else {
+                        self.memory_budget.release(chunk.estimated_bytes);
+                    }
+                }
+                self.shadow_chunks = retained_shadow_chunks;
 
-            (visible_light_volume, visible_bounds)
-        } else {
-            // There's no daylight or no shadows, so there's no reason to keep any
-            // shadow chunks around.
-            self.shadow_chunks.clear();
-            (Vec::new(), math::Aabr {
-                min: math::Vec2::zero(),
-                max: math::Vec2::zero(),
-            })
-        };
+                (visible_light_volume, visible_bounds)
+            } else {
+                // There's no daylight or no shadows, so there's no reason to keep any
+                // shadow chunks around.
+                for (_, chunk) in self.shadow_chunks.drain(..) {
+                    self.memory_budget.release(chunk.estimated_bytes);
+                }
+                (Vec::new(), math::Aabr {
+                    min: math::Vec2::zero(),
+                    max: math::Vec2::zero(),
+                })
+            };
         drop(guard);
         span!(guard, "Rain occlusion magic");
         // Check if there is rain near the camera
@@ -1499,6 +1613,18 @@ impl<V: RectRasterableVol> Terrain<V> {
     }
 
     pub fn shadow_chunk_count(&self) -> usize { self.shadow_chunks.len() }
+
+    pub fn stream_metrics(&self) -> TerrainStreamMetrics {
+        TerrainStreamMetrics {
+            peak_upload_time: self.peak_upload_spent,
+            upload_budget: self.stream_config.mesh_upload_budget,
+            upload_budget_overruns: self.upload_budget_overruns,
+            estimated_memory_bytes: self.memory_budget.used_bytes(),
+            peak_estimated_memory_bytes: self.memory_budget.peak_bytes(),
+            memory_budget_bytes: self.memory_budget.limit_bytes(),
+            shadow_chunks: self.shadow_chunks.len(),
+        }
+    }
 
     pub fn render_shadows<'a>(
         &'a self,

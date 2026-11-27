@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid51331",
+  "B": "/home/dev/feedback/uid51331",
+  "sha": "5bda569ce072cfce2138a6476fdf7d06f060c560",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "veloren",
+    "repo": "veloren",
+    "sha": "5bda569ce072cfce2138a6476fdf7d06f060c560"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "veloren",
+    "cloneUrl": "https://github.com/Rrr119/veloren.git"
+  },
+  "at": "2026-11-27T16:16:46.523Z"
+}

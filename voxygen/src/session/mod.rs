@@ -1705,6 +1705,7 @@ impl PlayState for SessionState {
                     num_lights: self.scene.lights().len() as u32,
                     num_visible_chunks: self.scene.terrain().visible_chunk_count() as u32,
                     num_shadow_chunks: self.scene.terrain().shadow_chunk_count() as u32,
+                    terrain_stream: self.scene.terrain().stream_metrics(),
                     num_figures: self.scene.figure_mgr().figure_count() as u32,
                     num_figures_visible: self.scene.figure_mgr().figure_count_visible() as u32,
                     num_particles: self.scene.particle_mgr().particle_count() as u32,
